@@ -1,3 +1,5 @@
+var POLIS_BASE_URL = "https://poliscommunity.crown-shy.com";
+
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('Polis')
@@ -30,7 +32,7 @@ function getPolisConvoId() {
 
 function fetchStatements(convoId) {
   var options = {};
-  const url = `https://pol.is/api/v3/comments?conversation_id=${convoId}&moderation=true&include_voting_patterns=true`;
+  const url = `${POLIS_BASE_URL}/api/v3/comments?conversation_id=${convoId}&moderation=true&include_voting_patterns=true`;
   const response = UrlFetchApp.fetch(url, options);
   const allStatements = JSON.parse(response.getContentText());
   // Logger.log(JSON.stringify(allStatements, null, 2));
@@ -40,7 +42,7 @@ function fetchStatements(convoId) {
 
 function fetchPCA(convoId) {
   var options = {};
-  const url = `https://pol.is/api/v3/participationInit?conversation_id=${convoId}`;
+  const url = `${POLIS_BASE_URL}/api/v3/participationInit?conversation_id=${convoId}`;
   const response = UrlFetchApp.fetch(url, options);
   const convoInitData = JSON.parse(response.getContentText());
   const allPCAData = JSON.parse(convoInitData.pca);
