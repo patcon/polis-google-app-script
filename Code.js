@@ -52,47 +52,59 @@ function fetchPCA(baseUrl, convoId) {
   const url = `${baseUrl}/api/v3/participationInit?conversation_id=${convoId}`;
   const response = UrlFetchApp.fetch(url, options);
   const convoInitData = JSON.parse(response.getContentText());
-  const allPCAData = JSON.parse(convoInitData.pca);
 
-  function processConsensus(input) {
-    var output = {}
-    for (const [voteType, statementsArray] of Object.entries(input)) {
-      statementsArray.forEach(stmnt => output[stmnt.tid] = {
-        voteType,
-        percent: stmnt["p-success"]*100,
-      })
-    }
-    // Logger.log(JSON.stringify(output, null, 2))
-    return output
+  // Handle both old and new server responses
+  let allPCAData;
+  if (typeof convoInitData.pca === "string") {
+    // Old server: pca is JSON string
+    allPCAData = JSON.parse(convoInitData.pca);
+  } else if (convoInitData.pca?.asJSON) {
+    // Newer server: pca object with asJSON key
+    allPCAData = convoInitData.pca.asJSON;
+  } else {
+    throw new Error("Unknown PCA format: " + JSON.stringify(convoInitData.pca));
   }
 
-  // TODO: Fix repness to allow tids to have multiple purposes
-  // e.g., agree to one group + disagree for another
-  function processRepness(input) {
-    var output = {}
-    for (const [groupId, statementsArray] of Object.entries(input)) {
-      statementsArray.forEach(stmnt => output[stmnt.tid] = {
-        voteType: stmnt["repful-for"],
-        percent: stmnt["p-success"]*100,
-        groupId,
-      })
+  function processConsensus(input = {}) {
+    var output = {};
+    for (const [voteType, statementsArray] of Object.entries(input)) {
+      statementsArray.forEach(stmnt => {
+        output[stmnt.tid] = {
+          voteType,
+          percent: stmnt["p-success"]*100,
+        };
+      });
     }
-    // Logger.log(JSON.stringify(output, null, 2))
-    return output
+    Logger.log(JSON.stringify(output, null, 2));
+    return output;
+  }
+
+  function processRepness(input = {}) {
+    var output = {};
+    for (const [groupId, statementsArray] of Object.entries(input)) {
+      statementsArray.forEach(stmnt => {
+        output[stmnt.tid] = {
+          voteType: stmnt["repful-for"],
+          percent: stmnt["p-success"]*100,
+          groupId,
+        };
+      });
+    }
+    Logger.log(JSON.stringify(output, null, 2));
+    return output;
   }
 
   const processedData = {
-    commentPriorities: allPCAData["comment-priorities"],
-    groupAwareConsensus: allPCAData["group-aware-consensus"],
+    commentPriorities: allPCAData["comment-priorities"] || {},
+    groupAwareConsensus: allPCAData["group-aware-consensus"] || {},
     consensus: processConsensus(allPCAData["consensus"]),
     repness: processRepness(allPCAData["repness"]),
-  }
-  // Logger.log(JSON.stringify(allPCAData["consensus"], null, 2))
-  // Logger.log(JSON.stringify(Object.keys(allPCAData), null, 2))
-  Logger.log(JSON.stringify(processedData.consensus, null, 2))
-  Logger.log(JSON.stringify(processedData.repness, null, 2))
+  };
 
-  return processedData
+  Logger.log(JSON.stringify(processedData.consensus, null, 2));
+  Logger.log(JSON.stringify(processedData.repness, null, 2));
+
+  return processedData;
 }
 
 function convertSheetToObject(sheet) {
