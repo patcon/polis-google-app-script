@@ -1,4 +1,4 @@
-var POLIS_BASE_URL = "https://poliscommunity.crown-shy.com";
+// Base URL is now derived from the sheet name
 
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
@@ -9,8 +9,9 @@ function onOpen() {
 }
 
 // Allow case-insensitive naming of the sheet.
-// Require Polis conversation ID be in parentheses at the end.
-const STATEMENT_SHEET_NAME_RE = /^live statements \((?<convoId>[a-z0-9]+)\)/i
+// Require full Polis conversation URL after colon.
+const STATEMENT_SHEET_NAME_RE =
+  /^live statements:\s*(?<url>https?:\/\/[^\s]+)$/i
 // TODO: Allow Config class to use this regex.
 // const CONFIG_SHEET_NAME_RE = /^configuration$/i
 
@@ -21,18 +22,24 @@ function getStatementsSheet() {
   return statementsSheet
 }
 
-function getPolisConvoId() {
+function getPolisConversationInfo() {
   const statementsSheet = getStatementsSheet()
   const match = statementsSheet?.getName().match(STATEMENT_SHEET_NAME_RE)
-  const convoId = match?.groups.convoId
+  if (!match) return null
 
-  // Logger.log(convoId)
-  return convoId
+  const fullUrl = match.groups.url.replace(/\/+$/, "") // trim trailing slash
+  const parts = fullUrl.split("/")
+  const convoId = parts.pop()
+  const baseUrl = parts.join("/")
+
+  return { baseUrl, convoId }
 }
 
-function fetchStatements(convoId) {
+function fetchStatements(baseUrl, convoId) {
   var options = {};
-  const url = `${POLIS_BASE_URL}/api/v3/comments?conversation_id=${convoId}&moderation=true&include_voting_patterns=true`;
+  const url =
+    `${baseUrl}/api/v3/comments?conversation_id=${convoId}` +
+    `&moderation=true&include_voting_patterns=true`;
   const response = UrlFetchApp.fetch(url, options);
   const allStatements = JSON.parse(response.getContentText());
   // Logger.log(JSON.stringify(allStatements, null, 2));
@@ -40,9 +47,9 @@ function fetchStatements(convoId) {
   return allStatements
 }
 
-function fetchPCA(convoId) {
+function fetchPCA(baseUrl, convoId) {
   var options = {};
-  const url = `${POLIS_BASE_URL}/api/v3/participationInit?conversation_id=${convoId}`;
+  const url = `${baseUrl}/api/v3/participationInit?conversation_id=${convoId}`;
   const response = UrlFetchApp.fetch(url, options);
   const convoInitData = JSON.parse(response.getContentText());
   const allPCAData = JSON.parse(convoInitData.pca);
@@ -151,8 +158,8 @@ function findReusableEmptyRows(valuesObject) {
 }
 
 // Helper: submit a single statement to Polis
-function submitStatement(txt, conversation_id, vote) {
-  const url = `${POLIS_BASE_URL}/api/v3/comments`
+function submitStatement(baseUrl, txt, conversation_id, vote) {
+  const url = `${baseUrl}/api/v3/comments`
   const payload = { txt, vote, conversation_id }
 
   const response = UrlFetchApp.fetch(url, {
@@ -200,14 +207,20 @@ class Config {
 }
 
 function updateStatementSheet() {
-  const CONVO_ID = getPolisConvoId()
+  const convoInfo = getPolisConversationInfo()
+  if (!convoInfo) {
+    throw new Error("Invalid sheet name format")
+  }
+
+  const { baseUrl, convoId: CONVO_ID } = convoInfo
   const SHEET_NAME = getStatementsSheet().getName();
   const config = new Config()
 
   try {
     // Get all the cell values.
     var statementsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
-    const {dataRange, valuesArray: data, header, valuesObject: obj} = convertSheetToObject(statementsSheet)
+    const {dataRange, valuesArray: data, header, valuesObject: obj} =
+      convertSheetToObject(statementsSheet)
 
     if (!header.includes("tid")) {
       throw new Error("Sheet must contain a 'tid' column")
@@ -217,10 +230,10 @@ function updateStatementSheet() {
     const reusableRowIndices = findReusableEmptyRows(obj)
 
     // Fetch all statements from Polis platform API.
-    const allStatements = fetchStatements(CONVO_ID)
+    const allStatements = fetchStatements(baseUrl, CONVO_ID)
 
     // Fetch PCA data from Polis platform API.
-    const pcaData = fetchPCA(CONVO_ID)
+    const pcaData = fetchPCA(baseUrl, CONVO_ID)
 
     // ----- Submit ready_to_submit rows -----
     const readyColIndex = header.indexOf("ready_to_submit")
@@ -230,7 +243,7 @@ function updateStatementSheet() {
       obj.forEach((row, i) => {
         if (!hasTid(row.tid) && row.ready_to_submit === true && row.txt) {
           try {
-            const result = submitStatement(row.txt, CONVO_ID, 0)
+            const result = submitStatement(baseUrl, row.txt, CONVO_ID, 0)
             data[i][tidColIndex] = result.tid
             data[i][readyColIndex] = false
             tidToRowIndex.set(result.tid, i)
