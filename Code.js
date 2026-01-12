@@ -4,7 +4,7 @@ function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('Polis')
       // Run this function when the menu item is clicked.
-      .addItem('Update statement sheet', 'updateStatementSheet')
+      .addItem('Update statement sheet(s)', 'updateStatementSheets')
       .addToUi();
 }
 
@@ -15,16 +15,15 @@ const STATEMENT_SHEET_NAME_RE =
 // TODO: Allow Config class to use this regex.
 // const CONFIG_SHEET_NAME_RE = /^configuration$/i
 
-function getStatementsSheet() {
+// Return all sheets whose names match the regex
+function getStatementsSheets() {
   const sheets = SpreadsheetApp.getActiveSpreadsheet().getSheets()
-  const statementsSheet = sheets.find(sh => sh.getName().match(STATEMENT_SHEET_NAME_RE))
-
-  return statementsSheet
+  return sheets.filter(sh => sh.getName().match(STATEMENT_SHEET_NAME_RE))
 }
 
-function getPolisConversationInfo() {
-  const statementsSheet = getStatementsSheet()
-  const match = statementsSheet?.getName().match(STATEMENT_SHEET_NAME_RE)
+// Get baseUrl / convoId for a given sheet
+function getPolisConversationInfo(sheet) {
+  const match = sheet.getName().match(STATEMENT_SHEET_NAME_RE)
   if (!match) return null
 
   const fullUrl = match.groups.url.replace(/\/+$/, "") // trim trailing slash
@@ -218,95 +217,87 @@ class Config {
   }
 }
 
-function updateStatementSheet() {
-  const convoInfo = getPolisConversationInfo()
-  if (!convoInfo) {
-    throw new Error("Invalid sheet name format")
-  }
-
-  const { baseUrl, convoId: CONVO_ID } = convoInfo
-  const SHEET_NAME = getStatementsSheet().getName();
+function updateStatementSheets() {
+  const sheets = getStatementsSheets()
   const config = new Config()
 
-  try {
-    // Get all the cell values.
-    var statementsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
-    const {dataRange, valuesArray: data, header, valuesObject: obj} =
-      convertSheetToObject(statementsSheet)
-
-    if (!header.includes("tid")) {
-      throw new Error("Sheet must contain a 'tid' column")
+  sheets.forEach(sheet => {
+    const convoInfo = getPolisConversationInfo(sheet)
+    if (!convoInfo) {
+      Logger.log(`Skipping sheet ${sheet.getName()}: invalid format`)
+      return
     }
 
-    const tidToRowIndex = indexRowsByTid(obj)
-    const reusableRowIndices = findReusableEmptyRows(obj)
+    const { baseUrl, convoId: CONVO_ID } = convoInfo
+    const SHEET_NAME = sheet.getName()
 
-    // Fetch all statements from Polis platform API.
-    const allStatements = fetchStatements(baseUrl, CONVO_ID)
+    try {
+      const { dataRange, valuesArray: data, header, valuesObject: obj } =
+        convertSheetToObject(sheet)
 
-    // Fetch PCA data from Polis platform API.
-    const pcaData = fetchPCA(baseUrl, CONVO_ID)
+      if (!header.includes("tid")) {
+        Logger.log(`Skipping sheet ${sheet.getName()}: missing 'tid' column`)
+        return
+      }
 
-    // ----- Submit ready_to_submit rows -----
-    const readyColIndex = header.indexOf("ready_to_submit")
-    const tidColIndex = header.indexOf("tid")
+      const tidToRowIndex = indexRowsByTid(obj)
+      const reusableRowIndices = findReusableEmptyRows(obj)
 
-    if (readyColIndex !== -1) {
-      obj.forEach((row, i) => {
-        if (!hasTid(row.tid) && row.ready_to_submit === true && row.txt) {
-          try {
-            const result = submitStatement(baseUrl, row.txt, CONVO_ID, 0)
-            data[i][tidColIndex] = result.tid
-            data[i][readyColIndex] = false
-            tidToRowIndex.set(result.tid, i)
-          } catch (err) {
-            Logger.log(`Failed to submit row ${i + 2}: ${err.message}`)
+      // Fetch statements and PCA
+      const allStatements = fetchStatements(baseUrl, CONVO_ID)
+      const pcaData = fetchPCA(baseUrl, CONVO_ID)
+
+      const readyColIndex = header.indexOf("ready_to_submit")
+      const tidColIndex = header.indexOf("tid")
+
+      if (readyColIndex !== -1) {
+        obj.forEach((row, i) => {
+          if (!hasTid(row.tid) && row.ready_to_submit === true && row.txt) {
+            try {
+              const result = submitStatement(baseUrl, row.txt, CONVO_ID, 0)
+              data[i][tidColIndex] = result.tid
+              data[i][readyColIndex] = false
+              tidToRowIndex.set(result.tid, i)
+            } catch (err) {
+              Logger.log(`Failed to submit row ${i + 2} in ${SHEET_NAME}: ${err.message}`)
+            }
+          }
+        })
+      }
+
+      // Update statements
+      allStatements.forEach(statement => {
+        var matchingRowIndex = tidToRowIndex.get(statement.tid)
+
+        if (matchingRowIndex !== undefined) {
+          data[matchingRowIndex] = header.map((headerVal, i) => {
+            if (headerVal === "commentPriority") return pcaData.commentPriorities[statement.tid]
+            if (headerVal === "groupAwareConsensus") return pcaData.groupAwareConsensus[statement.tid]
+            if (headerVal === "consensus") {
+              const data = pcaData.consensus[statement.tid]
+              return data ? `${data.percent.toFixed(1)}% ${data.voteType}` : ""
+            }
+            if (headerVal === "consensus") return ""
+
+            const updated = config.getTransformedValue(statement, headerVal)
+            const previous = data[matchingRowIndex][i]
+            return updated !== undefined ? updated : previous
+          })
+        } else {
+          const newRow = header.map(headerVal => config.getTransformedValue(statement, headerVal))
+          if (reusableRowIndices.length > 0) {
+            matchingRowIndex = reusableRowIndices.shift()
+            data[matchingRowIndex] = newRow
+          } else {
+            data.push(newRow)
           }
         }
       })
+
+      dataRange.offset(1, 0, data.length).setValues(data)
+      Logger.log(`Updated sheet: ${SHEET_NAME}`)
+    } catch (err) {
+      Logger.log(`Error updating sheet ${SHEET_NAME}: ${err.message}`)
     }
-
-    // For each row of allStatements
-    allStatements.forEach((statement) => {
-      var matchingRowIndex = tidToRowIndex.get(statement.tid)
-
-      if (matchingRowIndex !== undefined) {
-        // If found, fetch statements values based on header,
-        // and if none, use previous cell value.
-        data[matchingRowIndex] = header.map((headerVal, i) => {
-          // Get extra metadata about comments, if available in PCA data.
-          if (headerVal === "commentPriority") return pcaData.commentPriorities[statement.tid]
-          if (headerVal === "groupAwareConsensus") return pcaData.groupAwareConsensus[statement.tid]
-          if (headerVal === "consensus") {
-            const data = pcaData.consensus[statement.tid]
-            return data ? `${data.percent.toFixed(1)}% ${data.voteType}` : ""
-          }
-          // TODO: Add ability to output repness.
-          if (headerVal === "consensus") return ""
-
-          const updated = config.getTransformedValue(statement, headerVal)
-          const previous = data[matchingRowIndex][i]
-          // If value is missing from updated API response
-          // (ie. custom columns and formulas), use previous state.
-          return updated !== undefined ? updated : previous
-        })
-      } else {
-        // Otherwise, append a new object (reuse placeholder if possible).
-        const newRow = header.map(headerVal => config.getTransformedValue(statement, headerVal))
-
-        if (reusableRowIndices.length > 0) {
-          matchingRowIndex = reusableRowIndices.shift()
-          data[matchingRowIndex] = newRow
-        } else {
-          data.push(newRow)
-        }
-        // Logger.log(newRow);
-      }
-    })
-
-    // Update the sheet with new data, skipping header row.
-    dataRange.offset(1, 0, data.length).setValues(data);
-  } catch (f) {
-      Logger.log(f.message);
-  }
+  })
 }
