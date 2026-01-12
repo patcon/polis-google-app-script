@@ -118,6 +118,57 @@ function convertSheetToObject(sheet) {
   return { dataRange, valuesArray, header, valuesObject}
 }
 
+/* =========================
+ * New helper functions
+ * ========================= */
+
+function hasTid(value) {
+  // Explicit check so tid = 0 is valid
+  return value !== "" && value !== null && value !== undefined
+}
+
+function indexRowsByTid(valuesObject) {
+  var index = new Map()
+  valuesObject.forEach((row, i) => {
+    if (hasTid(row.tid)) {
+      index.set(row.tid, i)
+    }
+  })
+  return index
+}
+
+// Rows that can be safely reused: no tid AND no txt
+function findReusableEmptyRows(valuesObject) {
+  var reusable = []
+  valuesObject.forEach((row, i) => {
+    const tidEmpty = !hasTid(row.tid)
+    const txtEmpty = row.txt === "" || row.txt === null || row.txt === undefined
+    if (tidEmpty && txtEmpty) {
+      reusable.push(i)
+    }
+  })
+  return reusable
+}
+
+// Helper: submit a single statement to Polis
+function submitStatement(txt, conversation_id, vote) {
+  const url = `${POLIS_BASE_URL}/api/v3/comments`
+  const payload = { txt, vote, conversation_id }
+
+  const response = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  })
+
+  if (response.getResponseCode() >= 300) {
+    throw new Error(`Polis submission failed: ${response.getContentText()}`)
+  }
+
+  return JSON.parse(response.getContentText())
+}
+
 class Config {
   constructor(sheetName = "configuration") {
     this.sheetName = sheetName
@@ -158,17 +209,43 @@ function updateStatementSheet() {
     var statementsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
     const {dataRange, valuesArray: data, header, valuesObject: obj} = convertSheetToObject(statementsSheet)
 
+    if (!header.includes("tid")) {
+      throw new Error("Sheet must contain a 'tid' column")
+    }
+
+    const tidToRowIndex = indexRowsByTid(obj)
+    const reusableRowIndices = findReusableEmptyRows(obj)
+
     // Fetch all statements from Polis platform API.
     const allStatements = fetchStatements(CONVO_ID)
 
     // Fetch PCA data from Polis platform API.
     const pcaData = fetchPCA(CONVO_ID)
 
+    // ----- Submit ready_to_submit rows -----
+    const readyColIndex = header.indexOf("ready_to_submit")
+    const tidColIndex = header.indexOf("tid")
+
+    if (readyColIndex !== -1) {
+      obj.forEach((row, i) => {
+        if (!hasTid(row.tid) && row.ready_to_submit === true && row.txt) {
+          try {
+            const result = submitStatement(row.txt, CONVO_ID, 0)
+            data[i][tidColIndex] = result.tid
+            data[i][readyColIndex] = false
+            tidToRowIndex.set(result.tid, i)
+          } catch (err) {
+            Logger.log(`Failed to submit row ${i + 2}: ${err.message}`)
+          }
+        }
+      })
+    }
+
     // For each row of allStatements
     allStatements.forEach((statement) => {
-      // Find row in sheet obj with matching statement.tid
-      const matchingRowIndex = obj.findIndex(row => row.tid === statement.tid)
-      if (matchingRowIndex > -1) {
+      var matchingRowIndex = tidToRowIndex.get(statement.tid)
+
+      if (matchingRowIndex !== undefined) {
         // If found, fetch statements values based on header,
         // and if none, use previous cell value.
         data[matchingRowIndex] = header.map((headerVal, i) => {
@@ -189,9 +266,15 @@ function updateStatementSheet() {
           return updated !== undefined ? updated : previous
         })
       } else {
-        // Otherwise, append a new object.
+        // Otherwise, append a new object (reuse placeholder if possible).
         const newRow = header.map(headerVal => config.getTransformedValue(statement, headerVal))
-        data.push(newRow)
+
+        if (reusableRowIndices.length > 0) {
+          matchingRowIndex = reusableRowIndices.shift()
+          data[matchingRowIndex] = newRow
+        } else {
+          data.push(newRow)
+        }
         // Logger.log(newRow);
       }
     })
